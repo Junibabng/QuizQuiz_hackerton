@@ -1,0 +1,65 @@
+# Prometheus alerting configuration for QuizQuiz observability.
+# The expressions assume that METRICS are exported via an adapter exposing the
+# custom registry (see app/metrics.py) as Prometheus gauges/counters with the
+# names referenced below.
+groups:
+  - name: generation-quality
+    rules:
+      - alert: LowGenerationSuccessRate
+        expr: quizquiz_generation_success_rate < 0.8
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Content generation success rate dropped below 80%"
+          description: |
+            The validation pipeline is rejecting more generated artefacts than
+            expected. Inspect recent generator releases for regressions.
+      - alert: ValidationFailureSpike
+        expr: increase(quizquiz_generation_failures_total[15m]) > 10
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Sudden spike in generation validation failures"
+          description: |
+            More than ten validation failures were observed in the last
+            fifteen minutes. Review the failure reason label to isolate the
+            offending component.
+  - name: bias-detection
+    rules:
+      - alert: AnswerPositionBias
+        expr: |
+          max_over_time(quizquiz_answer_position_bias_ratio[1h]) > 0.4
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Answer position bias detected for at least one cohort"
+          description: |
+            Learners are selecting the same answer index more than 40% of the
+            time. Inspect histogram breakdowns by cohort to rebalance option
+            shuffling.
+      - alert: LeechCardConcentration
+        expr: increase(quizquiz_leech_detections_total[24h]) > 50
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Too many cards classified as leeches"
+          description: |
+            A large number of items have repeatedly failed reviews. Consider
+            revising content quality or automatically suspending the affected
+            cards.
+      - alert: FSRSIntervalRegression
+        expr: |
+          histogram_quantile(0.5, sum(rate(quizquiz_fsrs_interval_minutes_bucket[6h])) by (le, cohort)) < 15
+        for: 30m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Median FSRS interval collapsed below 15 minutes"
+          description: |
+            Learners across one or more cohorts are receiving very short
+            review intervals, which signals a potential recall regression or
+            biased content distribution.

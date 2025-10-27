@@ -10,6 +10,7 @@ from itertools import cycle
 from typing import Deque, Dict, Iterable, List, MutableMapping, Optional, Tuple
 from uuid import UUID, uuid4
 
+from .metrics import METRICS
 from .models import (
     LearnPrepareRequest,
     LearnPrepareResponse,
@@ -20,6 +21,7 @@ from .models import (
     ReviewGradeRequest,
     ReviewGradeResponse,
 )
+from .validators import validate_note, validate_quiz_cards
 
 
 DEFAULT_SOURCES = [
@@ -249,6 +251,7 @@ class InMemoryRepository:
         self._cards: Dict[UUID, QuizCard] = {}
         self._states: Dict[UUID, FSRSState] = {}
         self._user_state: Dict[str, UserState] = {}
+        self._lapses: Dict[UUID, int] = {}
 
     # region Notes
     def save_note(
@@ -292,6 +295,13 @@ class InMemoryRepository:
 
     def save_card_state(self, card_id: UUID, state: "FSRSState") -> None:
         self._states[card_id] = state
+
+    def register_grade_outcome(self, card_id: UUID, grade: int) -> int:
+        if grade == 1:
+            self._lapses[card_id] = self._lapses.get(card_id, 0) + 1
+        else:
+            self._lapses[card_id] = 0
+        return self._lapses[card_id]
 
     # endregion
 
@@ -365,7 +375,20 @@ def build_quiz_items(request: LearnPrepareRequest) -> List[QuizCard]:
             )
         )
 
-    return items * max(request.per_type, 1)
+    per_type = max(request.per_type, 1)
+    if per_type == 1:
+        return items
+
+    expanded: List[QuizCard] = []
+    for _ in range(per_type):
+        for base in items:
+            clone = base.copy(deep=True)
+            clone.id = uuid4()
+            if clone.options:
+                for option in clone.options:
+                    option.id = uuid4()
+            expanded.append(clone)
+    return expanded
 
 
 def fisher_yates_shuffle(options: List[QuizOption], seed: int) -> Tuple[List[QuizOption], MutableMapping[UUID, int]]:
@@ -448,13 +471,20 @@ class LearningService:
         self._repository = repository
 
     def prepare(self, request: LearnPrepareRequest) -> LearnPrepareResponse:
+        METRICS.record_generation_attempt()
         note_id = uuid4()
-        markdown, sources, citations = build_markdown_summary(request)
-        if not sources:
-            raise ValueError("Generated notes must reference at least one source")
-        self._repository.save_note(note_id, markdown, citations)
-        items = build_quiz_items(request)
+        try:
+            markdown, sources = build_markdown_summary(request)
+            validate_note(markdown, sources)
+            items = build_quiz_items(request)
+            validate_quiz_cards(items)
+        except Exception as exc:
+            METRICS.record_generation_failure(exc.__class__.__name__)
+            raise
+
+        self._repository.save_note(note_id, markdown)
         self._repository.save_cards(items)
+        METRICS.record_generation_success(len(items))
         return LearnPrepareResponse(note_id=note_id, content_md=markdown, sources=sources, items=items)
 
 
@@ -472,11 +502,11 @@ class ReviewService:
             answer_index = None
             if card.type == "mcq" and card.options:
                 shuffled, answer_index = render_mcq(
-                    card,
-                    user_state,
-                    session_seed=hash((card.id, user_id, state.due)),
+                    card, user_state, session_seed=hash((card.id, user_id, due_at))
                 )
                 options = shuffled
+                if answer_index is not None:
+                    METRICS.record_answer_position(user_id, answer_index)
             due_cards.append(
                 ReviewCard(
                     card_id=card.id,
@@ -492,19 +522,18 @@ class ReviewService:
 
     def grade(self, request: ReviewGradeRequest) -> ReviewGradeResponse:
         now = datetime.utcnow()
-        state = self._repository.get_card_state(request.card_id)
-        updated_state = compute_fsrs_state(state, request.grade, now)
-        self._repository.save_card_state(request.card_id, updated_state)
-        state_payload = {
-            "stability_days": round(updated_state.stability, 4),
-            "difficulty": round(updated_state.difficulty, 4),
-            "last_review_at": updated_state.last_review.isoformat() if updated_state.last_review else None,
-            "lapses": updated_state.lapses,
-        }
+        # Simplified FSRS placeholder: increase interval by grade multiplier.
+        multiplier = {1: 5, 2: 30, 3: 60, 4: 120}[request.grade]
+        next_due = now + timedelta(minutes=multiplier)
+        self._repository.update_due(request.card_id, next_due)
+        lapse_count = self._repository.register_grade_outcome(request.card_id, request.grade)
+        METRICS.record_fsrs_outcome(request.grade, multiplier)
+        if lapse_count >= 3:
+            METRICS.record_leech(str(request.card_id))
         return ReviewGradeResponse(
             card_id=request.card_id,
-            next_due_at=updated_state.due,
-            state=state_payload,
+            next_due_at=next_due,
+            state={"interval_minutes": multiplier},
         )
 
 
