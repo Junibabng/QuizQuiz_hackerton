@@ -2,12 +2,11 @@
 from __future__ import annotations
 
 import random
-from collections import deque
-from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Deque, Dict, Iterable, List, MutableMapping, Optional, Tuple
+from typing import Dict, Iterable, List, MutableMapping, Tuple
 from uuid import UUID, uuid4
 
+from .domain import UserState
 from .models import (
     LearnPrepareRequest,
     LearnPrepareResponse,
@@ -18,6 +17,12 @@ from .models import (
     ReviewGradeRequest,
     ReviewGradeResponse,
 )
+from .repositories import (
+    FSRSStateRepository,
+    NoteRepository,
+    QuizCardRepository,
+    UserMetadataRepository,
+)
 
 
 DEFAULT_SOURCES = [
@@ -25,74 +30,6 @@ DEFAULT_SOURCES = [
     "https://en.wikipedia.org/wiki/Flashcard",
     "https://en.wikipedia.org/wiki/Active_recall",
 ]
-
-
-@dataclass
-class UserState:
-    """Keeps track of position bias for a single user."""
-
-    answer_position_histogram: List[int] = field(default_factory=lambda: [0, 0, 0, 0])
-    recent_positions: Deque[int] = field(default_factory=lambda: deque(maxlen=20))
-
-    def register_position(self, position: int) -> None:
-        self.answer_position_histogram[position] += 1
-        self.recent_positions.append(position)
-
-    def least_used_position(self) -> int:
-        return min(range(len(self.answer_position_histogram)), key=self.answer_position_histogram.__getitem__)
-
-    def most_used_position(self) -> int:
-        return max(range(len(self.answer_position_histogram)), key=self.answer_position_histogram.__getitem__)
-
-    def has_bias(self, threshold: float = 0.35) -> bool:
-        total = sum(self.recent_positions and [1] * len(self.recent_positions) or [0])
-        if not total:
-            return False
-        counts = {pos: list(self.recent_positions).count(pos) for pos in set(self.recent_positions)}
-        return any(count / total > threshold for count in counts.values())
-
-
-class InMemoryRepository:
-    """Toy repository that simulates persistence for early development."""
-
-    def __init__(self) -> None:
-        self._notes: Dict[UUID, str] = {}
-        self._cards: Dict[UUID, QuizCard] = {}
-        self._due: Dict[UUID, datetime] = {}
-        self._user_state: Dict[str, UserState] = {}
-
-    # region Notes
-    def save_note(self, note_id: UUID, markdown: str) -> None:
-        self._notes[note_id] = markdown
-
-    def get_note(self, note_id: UUID) -> str:
-        return self._notes[note_id]
-
-    # endregion
-
-    # region Cards
-    def save_cards(self, cards: Iterable[QuizCard], due_in_minutes: int = 60) -> None:
-        for card in cards:
-            self._cards[card.id] = card
-            self._due[card.id] = datetime.utcnow() + timedelta(minutes=due_in_minutes)
-
-    def get_due_cards(self) -> List[Tuple[QuizCard, datetime]]:
-        now = datetime.utcnow()
-        return [
-            (self._cards[card_id], due_at)
-            for card_id, due_at in self._due.items()
-            if due_at <= now
-        ]
-
-    def update_due(self, card_id: UUID, next_due_at: datetime) -> None:
-        self._due[card_id] = next_due_at
-
-    # endregion
-
-    def get_user_state(self, user_id: str) -> UserState:
-        if user_id not in self._user_state:
-            self._user_state[user_id] = UserState()
-        return self._user_state[user_id]
 
 
 def build_markdown_summary(request: LearnPrepareRequest) -> Tuple[str, List[str]]:
@@ -204,28 +141,38 @@ def render_mcq(card: QuizCard, user_state: UserState, session_seed: int) -> Tupl
 class LearningService:
     """Facade exposing the prepare endpoint behaviour."""
 
-    def __init__(self, repository: InMemoryRepository) -> None:
-        self._repository = repository
+    def __init__(
+        self, note_repository: NoteRepository, card_repository: QuizCardRepository
+    ) -> None:
+        self._note_repository = note_repository
+        self._card_repository = card_repository
 
     def prepare(self, request: LearnPrepareRequest) -> LearnPrepareResponse:
         note_id = uuid4()
         markdown, sources = build_markdown_summary(request)
-        self._repository.save_note(note_id, markdown)
+        self._note_repository.save(request.user_id, note_id, markdown)
         items = build_quiz_items(request)
-        self._repository.save_cards(items)
+        self._card_repository.save_cards(request.user_id, items)
         return LearnPrepareResponse(note_id=note_id, content_md=markdown, sources=sources, items=items)
 
 
 class ReviewService:
     """Manages the spaced repetition review loop."""
 
-    def __init__(self, repository: InMemoryRepository) -> None:
-        self._repository = repository
+    def __init__(
+        self,
+        card_repository: QuizCardRepository,
+        metadata_repository: UserMetadataRepository,
+        fsrs_repository: FSRSStateRepository,
+    ) -> None:
+        self._card_repository = card_repository
+        self._metadata_repository = metadata_repository
+        self._fsrs_repository = fsrs_repository
 
     def get_due(self, user_id: str) -> ReviewDueResponse:
-        user_state = self._repository.get_user_state(user_id)
+        user_state = self._metadata_repository.get_user_state(user_id)
         due_cards: List[ReviewCard] = []
-        for card, due_at in self._repository.get_due_cards():
+        for card, due_at in self._card_repository.get_due_cards(user_id):
             options = None
             answer_index = None
             if card.type == "mcq" and card.options:
@@ -241,6 +188,7 @@ class ReviewService:
                     due_at=due_at,
                 )
             )
+        self._metadata_repository.save_user_state(user_id, user_state)
         return ReviewDueResponse(due=due_cards)
 
     def grade(self, request: ReviewGradeRequest) -> ReviewGradeResponse:
@@ -248,12 +196,21 @@ class ReviewService:
         # Simplified FSRS placeholder: increase interval by grade multiplier.
         multiplier = {1: 5, 2: 30, 3: 60, 4: 120}[request.grade]
         next_due = now + timedelta(minutes=multiplier)
-        self._repository.update_due(request.card_id, next_due)
-        return ReviewGradeResponse(card_id=request.card_id, next_due_at=next_due, state={"interval_minutes": multiplier})
+        previous_state = self._fsrs_repository.load_state(request.user_id, request.card_id) or {}
+        state = {
+            "interval_minutes": multiplier,
+            "last_grade": request.grade,
+            "previous_interval": previous_state.get("interval_minutes"),
+        }
+        try:
+            self._card_repository.update_due(request.user_id, request.card_id, next_due)
+        except KeyError as exc:
+            raise ValueError(str(exc)) from exc
+        self._fsrs_repository.save_state(request.user_id, request.card_id, state)
+        return ReviewGradeResponse(card_id=request.card_id, next_due_at=next_due, state=state)
 
 
 __all__ = [
-    "InMemoryRepository",
     "LearningService",
     "ReviewService",
     "build_markdown_summary",
