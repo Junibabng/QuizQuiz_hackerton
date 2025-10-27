@@ -31,6 +31,26 @@ DEFAULT_SOURCES = [
 ]
 
 
+DEFAULT_COHORT = "general"
+COHORT_PREFIX_MAP = {
+    "beta": "beta",
+    "control": "control",
+    "pilot": "pilot",
+    "edu": "education",
+    "enterprise": "enterprise",
+}
+
+
+def resolve_user_cohort(user_id: str) -> str:
+    """Map a user identifier to a bounded cohort label used in metrics."""
+
+    normalized = (user_id or "").strip().lower()
+    for prefix, cohort in COHORT_PREFIX_MAP.items():
+        if normalized.startswith(prefix):
+            return cohort
+    return DEFAULT_COHORT
+
+
 def extract_document(document_id: str) -> Tuple[Dict[str, List[str]], List[Dict[str, str]]]:
     """Simulated document extraction returning structured sections with citations."""
 
@@ -496,6 +516,7 @@ class ReviewService:
 
     def get_due(self, user_id: str) -> ReviewDueResponse:
         user_state = self._repository.get_user_state(user_id)
+        cohort = resolve_user_cohort(user_id)
         due_cards: List[ReviewCard] = []
         for card, state in self._repository.get_due_cards():
             options = None
@@ -506,7 +527,7 @@ class ReviewService:
                 )
                 options = shuffled
                 if answer_index is not None:
-                    METRICS.record_answer_position(user_id, answer_index)
+                    METRICS.record_answer_position(cohort, answer_index)
             due_cards.append(
                 ReviewCard(
                     card_id=card.id,
