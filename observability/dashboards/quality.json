@@ -1,0 +1,105 @@
+{
+  "title": "QuizQuiz Quality & Bias Overview",
+  "description": "Tracks content generation, review performance, and cohort-level bias indicators.",
+  "refresh": "30s",
+  "panels": [
+    {
+      "id": 1,
+      "title": "Generation success rate",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "quizquiz_generation_success_rate",
+          "legend": "Success rate"
+        },
+        {
+          "expr": "quizquiz_generation_failures_total",
+          "legend": "Failures",
+          "type": "bar"
+        }
+      ],
+      "description": "Validations vs. attempts to surface regressions in the content pipeline."
+    },
+    {
+      "id": 2,
+      "title": "Validation failures by reason",
+      "type": "stat",
+      "targets": [
+        {
+          "expr": "sum by (reason) (increase(quizquiz_generation_failures_total{reason!=""}[1h]))",
+          "legend": "{{reason}}"
+        }
+      ],
+      "description": "Top validation errors in the last hour grouped by reason label."
+    },
+    {
+      "id": 3,
+      "title": "Answer position histogram by cohort",
+      "type": "heatmap",
+      "targets": [
+        {
+          "expr": "quizquiz_answer_position_histogram",
+          "legend": "{{cohort}} index={{position}}"
+        }
+      ],
+      "description": "Highlights positional bias across user cohorts to ensure shuffling fairness."
+    },
+    {
+      "id": 4,
+      "title": "FSRS interval distribution",
+      "type": "histogram",
+      "targets": [
+        {
+          "expr": "quizquiz_fsrs_interval_minutes_bucket",
+          "legend": "grade={{grade}}"
+        }
+      ],
+      "description": "Tracks the distribution of scheduled intervals across FSRS grades."
+    },
+    {
+      "id": 5,
+      "title": "Leech detections",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "rate(quizquiz_leech_detections_total[1h])",
+          "legend": "All cohorts"
+        }
+      ],
+      "description": "Frequency of cards classified as leeches (>=3 consecutive lapses)."
+    },
+    {
+      "id": 6,
+      "title": "Cohort quality comparison",
+      "type": "table",
+      "targets": [
+        {
+          "expr": "quizquiz_generation_success_rate{cohort!=""}",
+          "legend": "Success rate"
+        },
+        {
+          "expr": "quizquiz_answer_position_bias_ratio",
+          "legend": "Answer bias"
+        },
+        {
+          "expr": "histogram_quantile(0.5, sum(rate(quizquiz_fsrs_interval_minutes_bucket[6h])) by (cohort, le))",
+          "legend": "Median interval"
+        }
+      ],
+      "description": "Side-by-side quality metrics for key user cohorts to catch biased experiences."
+    }
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "cohort",
+        "label": "User cohort",
+        "type": "query",
+        "datasource": "Prometheus",
+        "query": "label_values(quizquiz_answer_position_histogram, cohort)",
+        "includeAll": true,
+        "multi": true
+      }
+    ]
+  }
+}
