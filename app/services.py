@@ -126,6 +126,24 @@ def build_quiz_items(request: LearnPrepareRequest) -> List[QuizCard]:
     items: List[QuizCard] = []
     topic = request.topic_text or "the uploaded document"
 
+    def _clone_card(card: QuizCard) -> QuizCard:
+        """Return a deep copy of a quiz card with fresh identifiers."""
+
+        cloned_options = None
+        if card.options:
+            cloned_options = [QuizOption(text=option.text) for option in card.options]
+
+        return QuizCard(
+            type=card.type,
+            front=card.front,
+            options=cloned_options,
+            answer=card.answer,
+            explanation=card.explanation,
+            sources=list(card.sources),
+            skills=list(card.skills),
+            difficulty=card.difficulty,
+        )
+
     if "mcq" in request.quiz_types:
         options = [
             QuizOption(text="It optimizes review intervals using learner feedback."),
@@ -168,7 +186,19 @@ def build_quiz_items(request: LearnPrepareRequest) -> List[QuizCard]:
             )
         )
 
-    return items * max(request.per_type, 1)
+    per_type = max(request.per_type, 1)
+    if per_type == 1:
+        return items
+
+    expanded: List[QuizCard] = []
+    for iteration in range(per_type):
+        for card in items:
+            if iteration == 0:
+                expanded.append(card)
+            else:
+                expanded.append(_clone_card(card))
+
+    return expanded
 
 
 def fisher_yates_shuffle(options: List[QuizOption], seed: int) -> Tuple[List[QuizOption], MutableMapping[UUID, int]]:
