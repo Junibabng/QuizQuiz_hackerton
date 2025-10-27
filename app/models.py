@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from enum import Enum
 from typing import List, Literal, Optional
 from uuid import UUID, uuid4
 
@@ -58,13 +59,55 @@ class LearnPrepareRequest(BaseModel):
         return values
 
 
-class LearnPrepareResponse(BaseModel):
-    """Response body for /v1/learn/prepare."""
+class LearnPrepareJobStatus(str, Enum):
+    """High-level lifecycle states for the async learning pipeline."""
+
+    QUEUED = "queued"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class LearnPrepareMilestoneStatus(str, Enum):
+    """State transitions for pipeline milestones."""
+
+    PENDING = "pending"
+    STARTED = "started"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class LearnPrepareMilestone(BaseModel):
+    """Progress snapshot for a single pipeline milestone."""
+
+    name: Literal["ingestion", "summarization", "quiz_synthesis", "rendering"]
+    status: LearnPrepareMilestoneStatus
+
+
+class LearnPrepareArtifacts(BaseModel):
+    """Artifacts produced once the learning pipeline finishes."""
 
     note_id: UUID
     content_md: str
     sources: List[str]
     items: List[QuizCard]
+
+
+class LearnPrepareResponse(BaseModel):
+    """Initial response from /v1/learn/prepare with the job handle."""
+
+    job_id: UUID
+    status: LearnPrepareJobStatus
+
+
+class LearnPrepareJobStatusResponse(BaseModel):
+    """Job polling payload describing status, milestones, and artifacts."""
+
+    job_id: UUID
+    status: LearnPrepareJobStatus
+    milestones: List[LearnPrepareMilestone]
+    artifacts: Optional[LearnPrepareArtifacts] = None
+    error: Optional[str] = None
 
 
 class ReviewCard(BaseModel):
@@ -102,6 +145,11 @@ __all__ = [
     "QuizOption",
     "LearnPrepareRequest",
     "LearnPrepareResponse",
+    "LearnPrepareJobStatus",
+    "LearnPrepareMilestone",
+    "LearnPrepareMilestoneStatus",
+    "LearnPrepareArtifacts",
+    "LearnPrepareJobStatusResponse",
     "ReviewCard",
     "ReviewDueResponse",
     "ReviewGradeRequest",
