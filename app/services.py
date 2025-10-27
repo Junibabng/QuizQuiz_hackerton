@@ -4,6 +4,11 @@ from __future__ import annotations
 import itertools
 import math
 import random
+from datetime import datetime, timedelta
+from typing import Dict, Iterable, List, MutableMapping, Tuple
+from uuid import UUID, uuid4
+
+from .domain import UserState
 import re
 from collections import deque
 from dataclasses import dataclass, field
@@ -24,6 +29,12 @@ from .models import (
     ReviewGradeRequest,
     ReviewGradeResponse,
 )
+from .repositories import (
+    FSRSStateRepository,
+    NoteRepository,
+    QuizCardRepository,
+    UserMetadataRepository,
+)
 from .validators import validate_note, validate_quiz_cards
 
 
@@ -34,6 +45,29 @@ DEFAULT_SOURCES = [
 ]
 
 
+def build_markdown_summary(request: LearnPrepareRequest) -> Tuple[str, List[str]]:
+    """Creates a deterministic placeholder markdown summary for early testing."""
+
+    heading = request.topic_text or f"Document {request.document_id}"
+    tldr = "\n".join(
+        [
+            "## TL;DR",
+            "- Active recall and spaced repetition accelerate retention.",
+            "- Personalized scheduling ensures efficient studying.",
+            "- Combining notes with quizzes encourages retrieval practice.",
+            "- FSRS adapts intervals based on learner feedback.",
+            "- Consistent review prevents forgetting curves from dominating.",
+        ]
+    )
+    body = f"# {heading}\n\n" + tldr
+    body += "\n\n## Key Points\n"
+    body += "- «Spacing effect» supports distributing practice over time. [1]\n"
+    body += "- «Retrieval practice» strengthens neural pathways. [2]\n"
+    body += "- Adaptive schedulers like FSRS leverage review quality scores. [3]\n"
+    body += "\n## Cloze Candidates\n"
+    body += "- The spacing effect demonstrates improved recall when study sessions are spread over time.\n"
+    body += "- FSRS updates the next review interval using grades from 1 to 4.\n"
+    return body, DEFAULT_SOURCES.copy()
 def extract_document(document_id: str) -> Tuple[Dict[str, List[str]], List[Dict[str, str]]]:
     """Simulated document extraction returning structured sections with citations."""
 
@@ -927,12 +961,19 @@ def compute_fsrs_state(state: FSRSState, grade: int, now: datetime) -> FSRSState
 class LearningService:
     """Facade exposing the prepare endpoint behaviour."""
 
-    def __init__(self, repository: InMemoryRepository) -> None:
-        self._repository = repository
+    def __init__(
+        self, note_repository: NoteRepository, card_repository: QuizCardRepository
+    ) -> None:
+        self._note_repository = note_repository
+        self._card_repository = card_repository
 
     def prepare(self, request: LearnPrepareRequest) -> LearnPrepareResponse:
         METRICS.record_generation_attempt()
         note_id = uuid4()
+        markdown, sources = build_markdown_summary(request)
+        self._note_repository.save(request.user_id, note_id, markdown)
+        items = build_quiz_items(request)
+        self._card_repository.save_cards(request.user_id, items)
         try:
             markdown, sources = build_markdown_summary(request)
             validate_note(markdown, sources)
@@ -952,6 +993,20 @@ class LearningService:
 class ReviewService:
     """Manages the spaced repetition review loop."""
 
+    def __init__(
+        self,
+        card_repository: QuizCardRepository,
+        metadata_repository: UserMetadataRepository,
+        fsrs_repository: FSRSStateRepository,
+    ) -> None:
+        self._card_repository = card_repository
+        self._metadata_repository = metadata_repository
+        self._fsrs_repository = fsrs_repository
+
+    def get_due(self, user_id: str) -> ReviewDueResponse:
+        user_state = self._metadata_repository.get_user_state(user_id)
+        due_cards: List[ReviewCard] = []
+        for card, due_at in self._card_repository.get_due_cards(user_id):
     def __init__(self, repository: InMemoryRepository, bias_config: Optional[BiasConfig] = None) -> None:
         self._repository = repository
         self._bias_config = bias_config or BiasConfig()
@@ -995,6 +1050,7 @@ class ReviewService:
                     is_leech=state.is_leech,
                 )
             )
+        self._metadata_repository.save_user_state(user_id, user_state)
         return ReviewDueResponse(due=due_cards)
 
     def grade(self, request: ReviewGradeRequest) -> ReviewGradeResponse:
@@ -1002,6 +1058,21 @@ class ReviewService:
         # Simplified FSRS placeholder: increase interval by grade multiplier.
         multiplier = {1: 5, 2: 30, 3: 60, 4: 120}[request.grade]
         next_due = now + timedelta(minutes=multiplier)
+        previous_state = self._fsrs_repository.load_state(request.user_id, request.card_id) or {}
+        state = {
+            "interval_minutes": multiplier,
+            "last_grade": request.grade,
+            "previous_interval": previous_state.get("interval_minutes"),
+        }
+        try:
+            self._card_repository.update_due(request.user_id, request.card_id, next_due)
+        except KeyError as exc:
+            raise ValueError(str(exc)) from exc
+        self._fsrs_repository.save_state(request.user_id, request.card_id, state)
+        return ReviewGradeResponse(card_id=request.card_id, next_due_at=next_due, state=state)
+
+
+__all__ = [
         self._repository.update_due(request.card_id, next_due)
         lapse_count = self._repository.register_grade_outcome(request.card_id, request.grade)
         METRICS.record_fsrs_outcome(request.grade, multiplier)

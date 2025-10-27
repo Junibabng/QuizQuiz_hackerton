@@ -44,6 +44,7 @@ class QuizCard(BaseModel):
 class LearnPrepareRequest(BaseModel):
     """Input body for /v1/learn/prepare."""
 
+    user_id: str
     document_id: Optional[str] = None
     topic_text: Optional[str] = None
     note_style: Optional[Literal["bullet", "outline", "anki"]] = "bullet"
@@ -85,6 +86,7 @@ class ReviewDueResponse(BaseModel):
 
 
 class ReviewGradeRequest(BaseModel):
+    user_id: str
     card_id: UUID
     grade: Literal[1, 2, 3, 4]
 
