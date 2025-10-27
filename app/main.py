@@ -1,6 +1,8 @@
 """FastAPI application exposing the QuizQuiz Hackerton endpoints."""
 from __future__ import annotations
 
+import os
+
 from fastapi import Depends, FastAPI, HTTPException
 
 from .models import (
@@ -10,7 +12,7 @@ from .models import (
     ReviewGradeRequest,
     ReviewGradeResponse,
 )
-from .services import InMemoryRepository, LearningService, ReviewService
+from .services import BiasConfig, InMemoryRepository, LearningService, ReviewService
 
 app = FastAPI(title="QuizQuiz Hackerton", version="0.1.0")
 
@@ -24,12 +26,18 @@ def get_learning_service(repository: InMemoryRepository = Depends(get_repository
 
 
 def get_review_service(repository: InMemoryRepository = Depends(get_repository)) -> ReviewService:
-    return ReviewService(repository)
+    return ReviewService(repository, bias_config=app.state.bias_config)
 
 
 @app.on_event("startup")
 def startup() -> None:
     app.state.repository = InMemoryRepository()
+    position_bias_threshold = float(os.getenv("QUIZQUIZ_POSITION_BIAS_THRESHOLD", "0.35"))
+    option_reuse_threshold = float(os.getenv("QUIZQUIZ_OPTION_REUSE_THRESHOLD", "0.65"))
+    app.state.bias_config = BiasConfig(
+        position_bias_threshold=position_bias_threshold,
+        option_reuse_threshold=option_reuse_threshold,
+    )
 
 
 @app.post("/v1/learn/prepare", response_model=LearnPrepareResponse)
