@@ -1,6 +1,7 @@
 """Core services implementing the learning and review workflows."""
 from __future__ import annotations
 
+import math
 import random
 from collections import deque
 from dataclasses import dataclass, field
@@ -52,13 +53,39 @@ class UserState:
         return any(count / total > threshold for count in counts.values())
 
 
+DEFAULT_DIFFICULTY = 5.0
+MIN_DIFFICULTY = 1.0
+MAX_DIFFICULTY = 10.0
+MIN_STABILITY = 0.1
+INITIAL_STABILITY = {1: 0.2, 2: 0.6, 3: 1.5, 4: 3.0}
+DIFFICULTY_DELTA = {1: 1.0, 2: 0.4, 3: -0.2, 4: -0.5}
+STABILITY_GROWTH = {1: -0.5, 2: 0.0, 3: 1.2, 4: 2.0}
+LEECH_LAPSES = 3
+
+
+@dataclass
+class FSRSState:
+    """Persisted FSRS scheduling parameters for a card."""
+
+    stability: float
+    difficulty: float
+    last_review: Optional[datetime]
+    due: datetime
+    lapses: int = 0
+    reviews: int = 0
+
+    @property
+    def is_leech(self) -> bool:
+        return self.lapses >= LEECH_LAPSES and self.stability <= 1.0
+
+
 class InMemoryRepository:
     """Toy repository that simulates persistence for early development."""
 
     def __init__(self) -> None:
         self._notes: Dict[UUID, str] = {}
         self._cards: Dict[UUID, QuizCard] = {}
-        self._due: Dict[UUID, datetime] = {}
+        self._states: Dict[UUID, FSRSState] = {}
         self._user_state: Dict[str, UserState] = {}
 
     # region Notes
@@ -72,20 +99,31 @@ class InMemoryRepository:
 
     # region Cards
     def save_cards(self, cards: Iterable[QuizCard], due_in_minutes: int = 60) -> None:
+        now = datetime.utcnow()
+        initial_due = now + timedelta(minutes=due_in_minutes)
+        initial_stability = max(due_in_minutes / (60 * 24), 0.2)
         for card in cards:
             self._cards[card.id] = card
-            self._due[card.id] = datetime.utcnow() + timedelta(minutes=due_in_minutes)
+            self._states[card.id] = FSRSState(
+                stability=initial_stability,
+                difficulty=DEFAULT_DIFFICULTY,
+                last_review=None,
+                due=initial_due,
+            )
 
-    def get_due_cards(self) -> List[Tuple[QuizCard, datetime]]:
+    def get_due_cards(self) -> List[Tuple[QuizCard, "FSRSState"]]:
         now = datetime.utcnow()
         return [
-            (self._cards[card_id], due_at)
-            for card_id, due_at in self._due.items()
-            if due_at <= now
+            (self._cards[card_id], state)
+            for card_id, state in self._states.items()
+            if state.due <= now
         ]
 
-    def update_due(self, card_id: UUID, next_due_at: datetime) -> None:
-        self._due[card_id] = next_due_at
+    def get_card_state(self, card_id: UUID) -> "FSRSState":
+        return self._states[card_id]
+
+    def save_card_state(self, card_id: UUID, state: "FSRSState") -> None:
+        self._states[card_id] = state
 
     # endregion
 
@@ -188,7 +226,7 @@ def fisher_yates_shuffle(options: List[QuizOption], seed: int) -> Tuple[List[Qui
 def render_mcq(card: QuizCard, user_state: UserState, session_seed: int) -> Tuple[List[QuizOption], int]:
     """Applies Fisher–Yates shuffle and bias correction for MCQ rendering."""
 
-    shuffled, position_map = fisher_yates_shuffle(card.options or [], session_seed)
+    shuffled, _ = fisher_yates_shuffle(card.options or [], session_seed)
     correct_option = next(opt for opt in shuffled if opt.text == card.answer)
     correct_index = shuffled.index(correct_option)
 
@@ -199,6 +237,49 @@ def render_mcq(card: QuizCard, user_state: UserState, session_seed: int) -> Tupl
 
     user_state.register_position(correct_index)
     return shuffled, correct_index
+
+
+def compute_fsrs_state(state: FSRSState, grade: int, now: datetime) -> FSRSState:
+    """Updates FSRS scheduling parameters based on the provided grade."""
+
+    if grade < 1 or grade > 4:
+        raise ValueError("FSRS grades must be between 1 and 4 inclusive")
+
+    elapsed_days = 0.0
+    if state.last_review:
+        elapsed_days = max((now - state.last_review).total_seconds() / 86400, 0.0)
+
+    retrievability = 1.0
+    if state.last_review and state.stability > 0:
+        retrievability = math.exp(math.log(0.9) * elapsed_days / max(state.stability, MIN_STABILITY))
+
+    difficulty_adjustment = DIFFICULTY_DELTA[grade] * (1 - retrievability)
+    new_difficulty = max(MIN_DIFFICULTY, min(MAX_DIFFICULTY, state.difficulty + difficulty_adjustment))
+
+    if state.last_review is None:
+        new_stability = INITIAL_STABILITY[grade]
+    else:
+        growth_factor = STABILITY_GROWTH[grade]
+        if grade == 1:
+            new_stability = max(MIN_STABILITY, state.stability * 0.3)
+        else:
+            growth = 1 + growth_factor * (1 - new_difficulty / MAX_DIFFICULTY) * (1 - retrievability)
+            new_stability = max(MIN_STABILITY, state.stability * growth)
+
+    if grade == 1:
+        lapses = state.lapses + 1
+    else:
+        lapses = state.lapses
+
+    updated = FSRSState(
+        stability=new_stability,
+        difficulty=new_difficulty,
+        last_review=now,
+        due=now + timedelta(days=new_stability),
+        lapses=lapses,
+        reviews=state.reviews + 1,
+    )
+    return updated
 
 
 class LearningService:
@@ -225,11 +306,15 @@ class ReviewService:
     def get_due(self, user_id: str) -> ReviewDueResponse:
         user_state = self._repository.get_user_state(user_id)
         due_cards: List[ReviewCard] = []
-        for card, due_at in self._repository.get_due_cards():
+        for card, state in self._repository.get_due_cards():
             options = None
             answer_index = None
             if card.type == "mcq" and card.options:
-                shuffled, answer_index = render_mcq(card, user_state, session_seed=hash((card.id, user_id, due_at)))
+                shuffled, answer_index = render_mcq(
+                    card,
+                    user_state,
+                    session_seed=hash((card.id, user_id, state.due)),
+                )
                 options = shuffled
             due_cards.append(
                 ReviewCard(
@@ -238,26 +323,38 @@ class ReviewService:
                     options=options,
                     answer_index=answer_index,
                     type=card.type,
-                    due_at=due_at,
+                    due_at=state.due,
+                    is_leech=state.is_leech,
                 )
             )
         return ReviewDueResponse(due=due_cards)
 
     def grade(self, request: ReviewGradeRequest) -> ReviewGradeResponse:
         now = datetime.utcnow()
-        # Simplified FSRS placeholder: increase interval by grade multiplier.
-        multiplier = {1: 5, 2: 30, 3: 60, 4: 120}[request.grade]
-        next_due = now + timedelta(minutes=multiplier)
-        self._repository.update_due(request.card_id, next_due)
-        return ReviewGradeResponse(card_id=request.card_id, next_due_at=next_due, state={"interval_minutes": multiplier})
+        state = self._repository.get_card_state(request.card_id)
+        updated_state = compute_fsrs_state(state, request.grade, now)
+        self._repository.save_card_state(request.card_id, updated_state)
+        state_payload = {
+            "stability_days": round(updated_state.stability, 4),
+            "difficulty": round(updated_state.difficulty, 4),
+            "last_review_at": updated_state.last_review.isoformat() if updated_state.last_review else None,
+            "lapses": updated_state.lapses,
+        }
+        return ReviewGradeResponse(
+            card_id=request.card_id,
+            next_due_at=updated_state.due,
+            state=state_payload,
+        )
 
 
 __all__ = [
+    "FSRSState",
     "InMemoryRepository",
     "LearningService",
     "ReviewService",
     "build_markdown_summary",
     "build_quiz_items",
     "fisher_yates_shuffle",
+    "compute_fsrs_state",
     "render_mcq",
 ]
