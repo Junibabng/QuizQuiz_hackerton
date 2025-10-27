@@ -34,14 +34,16 @@ class MetricsRegistry:
         self.generation_failures += 1
         self.generation_failure_reasons[reason] += 1
 
-    def record_answer_position(self, user_id: str, position: int) -> None:
-        histogram = self.answer_position_histograms[user_id]
+    def record_answer_position(self, cohort: str, position: int) -> None:
+        """Track answer placement frequency for a learner cohort."""
+
+        histogram = self.answer_position_histograms[cohort]
         if position >= len(histogram):
             histogram.extend([0] * (position - len(histogram) + 1))
         histogram[position] += 1
         total = sum(histogram)
         if total:
-            self.answer_position_bias_ratio[user_id] = max(histogram) / total
+            self.answer_position_bias_ratio[cohort] = max(histogram) / total
 
     def record_fsrs_outcome(self, grade: int, interval_minutes: int) -> None:
         self.fsrs_outcomes[(grade, interval_minutes)] += 1
