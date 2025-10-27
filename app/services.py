@@ -1,11 +1,13 @@
 """Core services implementing the learning and review workflows."""
 from __future__ import annotations
 
+import itertools
 import random
+import re
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Deque, Dict, Iterable, List, MutableMapping, Optional, Tuple
+from typing import Deque, Dict, Iterable, Iterator, List, MutableMapping, Optional, Sequence, Tuple
 from uuid import UUID, uuid4
 
 from .models import (
@@ -25,6 +27,15 @@ DEFAULT_SOURCES = [
     "https://en.wikipedia.org/wiki/Flashcard",
     "https://en.wikipedia.org/wiki/Active_recall",
 ]
+
+
+@dataclass
+class KeyFact:
+    term: str
+    statement: str
+    blank_statement: str
+    skill: str
+    sources: List[str]
 
 
 @dataclass
@@ -60,6 +71,7 @@ class InMemoryRepository:
         self._cards: Dict[UUID, QuizCard] = {}
         self._due: Dict[UUID, datetime] = {}
         self._user_state: Dict[str, UserState] = {}
+        self._option_pools: Dict[str, List[str]] = {}
 
     # region Notes
     def save_note(self, note_id: UUID, markdown: str) -> None:
@@ -73,6 +85,7 @@ class InMemoryRepository:
     # region Cards
     def save_cards(self, cards: Iterable[QuizCard], due_in_minutes: int = 60) -> None:
         for card in cards:
+            self._validate_card(card)
             self._cards[card.id] = card
             self._due[card.id] = datetime.utcnow() + timedelta(minutes=due_in_minutes)
 
@@ -93,6 +106,33 @@ class InMemoryRepository:
         if user_id not in self._user_state:
             self._user_state[user_id] = UserState()
         return self._user_state[user_id]
+
+    # region Option pools
+    def get_option_pool(self, skill: str) -> List[str]:
+        return list(self._option_pools.get(skill, []))
+
+    def extend_option_pool(self, skill: str, options: Sequence[str]) -> None:
+        pool = self._option_pools.setdefault(skill, [])
+        for option in options:
+            if option not in pool:
+                pool.append(option)
+
+    # endregion
+
+    def _validate_card(self, card: QuizCard) -> None:
+        banned_patterns = ["all of the above", "none of the above"]
+        answer_lower = card.answer.strip().lower()
+        if not card.answer.strip():
+            raise ValueError(f"Card {card.id} rejected due to empty answer")
+        if any(pattern in answer_lower for pattern in banned_patterns):
+            raise ValueError(f"Card {card.id} rejected due to banned answer pattern")
+
+        if card.type == "mcq":
+            option_texts = [opt.text for opt in card.options or []]
+            if card.answer not in option_texts:
+                raise ValueError(f"Card {card.id} rejected because answer missing from options")
+            if len(set(option_texts)) != len(option_texts):
+                raise ValueError(f"Card {card.id} rejected due to duplicate options")
 
 
 def build_markdown_summary(request: LearnPrepareRequest) -> Tuple[str, List[str]]:
@@ -120,55 +160,257 @@ def build_markdown_summary(request: LearnPrepareRequest) -> Tuple[str, List[str]
     return body, DEFAULT_SOURCES.copy()
 
 
-def build_quiz_items(request: LearnPrepareRequest) -> List[QuizCard]:
-    """Produces a minimal deterministic quiz set to unblock integration."""
+def _parse_markdown_sections(markdown: str) -> Dict[str, List[str]]:
+    sections: Dict[str, List[str]] = {}
+    current: Optional[str] = None
+    for line in markdown.splitlines():
+        stripped = line.rstrip()
+        if stripped.startswith("## "):
+            current = stripped[3:].strip()
+            sections.setdefault(current, [])
+        elif current:
+            sections[current].append(stripped)
+    return sections
 
+
+def _extract_bullets(lines: Iterable[str]) -> List[str]:
+    return [line[2:].strip() for line in lines if line.strip().startswith("- ")]
+
+
+def _slugify_skill(text: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")
+    return slug or "general_concepts"
+
+
+def _normalize_sentence(text: str) -> str:
+    cleaned = re.sub(r"\s+", " ", text.strip())
+    if not cleaned:
+        return ""
+    if cleaned[-1] not in ".!?":
+        cleaned += "."
+    return cleaned
+
+
+def _normalize_question(text: str) -> str:
+    cleaned = re.sub(r"\s+", " ", text.strip())
+    if not cleaned:
+        return ""
+    if cleaned.endswith("?"):
+        return cleaned
+    cleaned = cleaned.rstrip(".")
+    return cleaned + "?"
+
+
+def _sources_from_indices(indices: Iterable[str]) -> List[str]:
+    sources: List[str] = []
+    for idx in indices:
+        if not idx.isdigit():
+            continue
+        pointer = int(idx) - 1
+        if 0 <= pointer < len(DEFAULT_SOURCES):
+            candidate = DEFAULT_SOURCES[pointer]
+            if candidate not in sources:
+                sources.append(candidate)
+    return sources or DEFAULT_SOURCES[:1]
+
+
+def _derive_key_facts(markdown: str) -> List[KeyFact]:
+    sections = _parse_markdown_sections(markdown)
+    key_points = _extract_bullets(sections.get("Key Points", []))
+    facts: List[KeyFact] = []
+    fallback_sources = DEFAULT_SOURCES[:1]
+    for point in key_points:
+        indices = re.findall(r"\[(\d+)\]", point)
+        sources = _sources_from_indices(indices) if indices else fallback_sources
+        term_match = re.search(r"«([^»]+)»", point)
+        if term_match:
+            term = term_match.group(1).strip()
+            blank_template = re.sub(r"«[^»]+»", "_____", point)
+        else:
+            like_match = re.search(r"like ([A-Za-z0-9\- ]+)", point)
+            if like_match:
+                term = like_match.group(1).strip().split()[0]
+            else:
+                term = point.split()[0].strip("\"“”‘’.,")
+            blank_template = point.replace(term, "_____", 1)
+        statement = _normalize_sentence(re.sub(r"[«»]", "", re.sub(r"\[[^\]]*\]", "", point)))
+        blank_statement = _normalize_sentence(re.sub(r"\[[^\]]*\]", "", blank_template))
+        skill = _slugify_skill(term)
+        facts.append(
+            KeyFact(
+                term=term,
+                statement=statement,
+                blank_statement=blank_statement,
+                skill=skill,
+                sources=sources,
+            )
+        )
+    return facts
+
+
+def _infer_difficulty(statement: str, answer: str) -> str:
+    statement_tokens = statement.split()
+    answer_tokens = answer.split()
+    if len(statement_tokens) <= 12 and len(answer_tokens) <= 2:
+        return "easy"
+    if len(statement_tokens) <= 24 and len(answer_tokens) <= 4:
+        return "medium"
+    return "hard"
+
+
+def _mcq_items_from_notes(facts: Sequence[KeyFact], repository: InMemoryRepository) -> Iterator[QuizCard]:
+    if not facts:
+        return iter(())
+
+    fallback_distractors = [
+        "Interleaving practice",
+        "Passive rereading",
+        "Short-term cramming",
+        "Linear note review",
+    ]
+    all_terms = [fact.term for fact in facts]
+
+    def generator() -> Iterator[QuizCard]:
+        for fact in facts:
+            correct = fact.term
+            skill = fact.skill
+            distractor_candidates: List[str] = [term for term in all_terms if term != correct]
+            distractor_candidates.extend(repository.get_option_pool(skill))
+            distractor_candidates.extend(fallback_distractors)
+
+            unique_distractors: List[str] = []
+            for candidate in distractor_candidates:
+                candidate = candidate.strip()
+                if not candidate or candidate == correct:
+                    continue
+                if candidate not in unique_distractors:
+                    unique_distractors.append(candidate)
+                if len(unique_distractors) >= 3:
+                    break
+
+            while len(unique_distractors) < 3:
+                filler = f"Misconception {len(unique_distractors) + 1}"
+                if filler != correct and filler not in unique_distractors:
+                    unique_distractors.append(filler)
+
+            option_texts = [correct] + unique_distractors[:3]
+            options = [QuizOption(text=text) for text in option_texts]
+            repository.extend_option_pool(skill, option_texts)
+            front = _normalize_question(
+                f"Which concept best completes the statement: {fact.blank_statement.strip()}"
+            )
+            difficulty = _infer_difficulty(fact.statement, correct)
+            yield QuizCard(
+                type="mcq",
+                front=front,
+                options=options,
+                answer=correct,
+                explanation=fact.statement,
+                sources=fact.sources,
+                skills=[skill],
+                difficulty=difficulty,
+            )
+
+    return generator()
+
+
+def _cloze_items_from_notes(markdown: str) -> Iterator[QuizCard]:
+    sections = _parse_markdown_sections(markdown)
+    candidates = _extract_bullets(sections.get("Cloze Candidates", []))
+
+    def generator() -> Iterator[QuizCard]:
+        for sentence in candidates:
+            match = re.search(r"«([^»]+)»", sentence)
+            if not match:
+                continue
+            answer = match.group(1).strip()
+            front = _normalize_sentence(
+                re.sub(r"\[[^\]]*\]", "", re.sub(r"«[^»]+»", "_____", sentence))
+            )
+            explanation = _normalize_sentence(
+                re.sub(r"[«»]", "", re.sub(r"\[[^\]]*\]", "", sentence))
+            )
+            difficulty = _infer_difficulty(explanation, answer)
+            yield QuizCard(
+                type="cloze",
+                front=front,
+                answer=answer,
+                explanation=explanation,
+                sources=DEFAULT_SOURCES[:1],
+                skills=[_slugify_skill(answer)],
+                difficulty=difficulty,
+            )
+
+    return generator()
+
+
+def _derive_subject(statement: str) -> str:
+    lowered = statement.lower()
+    for verb in ["accelerate", "ensures", "encourages", "adapts", "prevents"]:
+        index = lowered.find(verb)
+        if index != -1:
+            return statement[:index].strip()
+    return statement
+
+
+def _short_answer_items_from_notes(markdown: str) -> Iterator[QuizCard]:
+    sections = _parse_markdown_sections(markdown)
+    bullet_points = _extract_bullets(sections.get("TL;DR", []))
+
+    def generator() -> Iterator[QuizCard]:
+        for point in bullet_points:
+            statement = _normalize_sentence(point)
+            subject = _derive_subject(statement)
+            subject_clean = subject.rstrip(".,")
+            if subject_clean:
+                front = f"What does the summary emphasize about {subject_clean}?"
+            else:
+                front = "What key idea does the summary emphasize?"
+            front = _normalize_question(front)
+            skill = _slugify_skill(subject_clean or "summary_insight")
+            difficulty = _infer_difficulty(statement, statement)
+            yield QuizCard(
+                type="short",
+                front=front,
+                answer=statement,
+                explanation=statement,
+                sources=DEFAULT_SOURCES[1:2],
+                skills=[skill],
+                difficulty=difficulty,
+            )
+
+    return generator()
+
+
+def _take_first(generator: Iterator[QuizCard], count: int) -> List[QuizCard]:
+    if count <= 0:
+        return []
+    items = list(itertools.islice(generator, count))
+    return items
+
+
+def build_quiz_items(
+    request: LearnPrepareRequest, markdown: str, repository: InMemoryRepository
+) -> List[QuizCard]:
+    """Generate quiz items by analysing the synthesized markdown notes."""
+
+    per_type = max(request.per_type, 1)
     items: List[QuizCard] = []
-    topic = request.topic_text or "the uploaded document"
+    key_facts = _derive_key_facts(markdown)
 
     if "mcq" in request.quiz_types:
-        options = [
-            QuizOption(text="It optimizes review intervals using learner feedback."),
-            QuizOption(text="It removes the need for spaced repetition."),
-            QuizOption(text="It limits reviews to a single attempt."),
-            QuizOption(text="It tracks only multiple-choice answers."),
-        ]
-        card = QuizCard(
-            type="mcq",
-            front=f"What is a key benefit of FSRS when studying {topic}?",
-            options=options,
-            answer=options[0].text,
-            explanation="FSRS adjusts the timing of future reviews according to performance.",
-            sources=DEFAULT_SOURCES[:2],
-            skills=["spaced_repetition"],
-        )
-        items.append(card)
+        mcq_generator = _mcq_items_from_notes(key_facts, repository)
+        items.extend(_take_first(mcq_generator, per_type))
 
     if "cloze" in request.quiz_types:
-        items.append(
-            QuizCard(
-                type="cloze",
-                front="Spaced repetition combats the «forgetting curve» by revisiting material at increasing intervals.",
-                answer="forgetting curve",
-                explanation="The forgetting curve describes how information decays without reinforcement.",
-                sources=DEFAULT_SOURCES[:1],
-                skills=["spacing_effect"],
-            )
-        )
+        cloze_generator = _cloze_items_from_notes(markdown)
+        items.extend(_take_first(cloze_generator, per_type))
 
     if "short" in request.quiz_types:
-        items.append(
-            QuizCard(
-                type="short",
-                front="Describe how retrieval practice enhances long-term retention.",
-                answer="It forces the learner to recall information, strengthening memory traces.",
-                explanation="Retrieval practice requires active recall, which reinforces neural pathways.",
-                sources=DEFAULT_SOURCES[1:2],
-                skills=["retrieval_practice"],
-            )
-        )
+        short_generator = _short_answer_items_from_notes(markdown)
+        items.extend(_take_first(short_generator, per_type))
 
-    return items * max(request.per_type, 1)
+    return items
 
 
 def fisher_yates_shuffle(options: List[QuizOption], seed: int) -> Tuple[List[QuizOption], MutableMapping[UUID, int]]:
@@ -211,7 +453,7 @@ class LearningService:
         note_id = uuid4()
         markdown, sources = build_markdown_summary(request)
         self._repository.save_note(note_id, markdown)
-        items = build_quiz_items(request)
+        items = build_quiz_items(request, markdown, self._repository)
         self._repository.save_cards(items)
         return LearnPrepareResponse(note_id=note_id, content_md=markdown, sources=sources, items=items)
 
