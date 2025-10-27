@@ -76,6 +76,9 @@ class ReviewCard(BaseModel):
     answer_index: Optional[int]
     type: QuizType
     due_at: datetime
+    variant_id: Optional[str] = None
+    stale_pool: bool = False
+    is_leech: bool = False
 
 
 class ReviewDueResponse(BaseModel):

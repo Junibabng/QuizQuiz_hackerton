@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
 
 from fastapi import Depends, FastAPI, HTTPException
 
@@ -14,6 +15,7 @@ from .models import (
 )
 from .services import LearningService, ReviewService
 from .storage import LocalNoteRepository, SqliteStudyRepository
+from .services import BiasConfig, InMemoryRepository, LearningService, ReviewService
 
 app = FastAPI(title="QuizQuiz Hackerton", version="0.1.0")
 
@@ -28,6 +30,9 @@ def get_review_service() -> ReviewService:
         app.state.study_repository,
         app.state.study_repository,
     )
+
+def get_review_service(repository: InMemoryRepository = Depends(get_repository)) -> ReviewService:
+    return ReviewService(repository, bias_config=app.state.bias_config)
 
 
 @app.on_event("startup")
@@ -44,6 +49,13 @@ def startup() -> None:
 def shutdown() -> None:
     if hasattr(app.state, "study_repository"):
         app.state.study_repository.close()
+    app.state.repository = InMemoryRepository()
+    position_bias_threshold = float(os.getenv("QUIZQUIZ_POSITION_BIAS_THRESHOLD", "0.35"))
+    option_reuse_threshold = float(os.getenv("QUIZQUIZ_OPTION_REUSE_THRESHOLD", "0.65"))
+    app.state.bias_config = BiasConfig(
+        position_bias_threshold=position_bias_threshold,
+        option_reuse_threshold=option_reuse_threshold,
+    )
 
 
 @app.post("/v1/learn/prepare", response_model=LearnPrepareResponse)
