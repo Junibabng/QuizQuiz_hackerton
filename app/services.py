@@ -5,6 +5,7 @@ import random
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from itertools import cycle
 from typing import Deque, Dict, Iterable, List, MutableMapping, Optional, Tuple
 from uuid import UUID, uuid4
 
@@ -25,6 +26,166 @@ DEFAULT_SOURCES = [
     "https://en.wikipedia.org/wiki/Flashcard",
     "https://en.wikipedia.org/wiki/Active_recall",
 ]
+
+
+def extract_document(document_id: str) -> Tuple[Dict[str, List[str]], List[Dict[str, str]]]:
+    """Simulated document extraction returning structured sections with citations."""
+
+    sections = {
+        "Overview": [
+            "«Spaced repetition» schedules are refined in the uploaded analysis to balance retention and study time.",
+            "The document emphasises aligning review difficulty with learner confidence to avoid burnout.",
+        ],
+        "Evidence": [
+            "Comparative experiments show FSRS outperforming static intervals for digital flashcards.",
+            "Learner diaries highlight the motivational impact of quick feedback loops.",
+        ],
+        "Practice Ideas": [
+            "Integrating bite-sized quizzes after each note page keeps retrieval practice active.",
+            "Weekly reflections encourage metacognitive monitoring of progress.",
+        ],
+    }
+    citations = [
+        {
+            "id": "DOC1",
+            "title": f"Document {document_id} Research Summary",
+            "url": f"https://docs.local/{document_id}/summary",
+            "snippet": "Key findings describing adaptive review cadences.",
+        },
+        {
+            "id": "DOC2",
+            "title": f"Document {document_id} Learner Interviews",
+            "url": f"https://docs.local/{document_id}/interviews",
+            "snippet": "Qualitative reflections on motivation and pacing.",
+        },
+        {
+            "id": "DOC3",
+            "title": "Open research on active recall",
+            "url": DEFAULT_SOURCES[2],
+            "snippet": "Overview article explaining active recall benefits.",
+        },
+    ]
+    return sections, citations
+
+
+def enrich_topic(topic_text: str) -> Tuple[Dict[str, List[str]], List[Dict[str, str]]]:
+    """Fallback enrichment that mimics external knowledge fetching for a free-text topic."""
+
+    topic = topic_text or "Learning Science"
+    sections = {
+        "Foundations": [
+            f"«Spaced repetition» keeps {topic.lower()} content fresh by revisiting knowledge just before forgetting.",
+            "Retrieval practice turns studying into an active challenge that deepens encoding.",
+        ],
+        "Techniques": [
+            "Layering multiple quiz formats supports transfer across recognition and recall.",
+            "Interleaving related subtopics prevents overfitting to a single pattern.",
+        ],
+        "Habits": [
+            "Short feedback cycles sustain motivation, especially when sessions are tracked visually.",
+            "Reflection prompts encourage learners to monitor confidence and adjust schedules.",
+        ],
+    }
+    citations = [
+        {
+            "id": "EXT1",
+            "title": "Spacing effect in practice",
+            "url": DEFAULT_SOURCES[0],
+            "snippet": "Research summary on distributed practice benefits.",
+        },
+        {
+            "id": "EXT2",
+            "title": "Flashcards as active learning tools",
+            "url": DEFAULT_SOURCES[1],
+            "snippet": "Article explaining why flashcards aid durable memory.",
+        },
+        {
+            "id": "EXT3",
+            "title": "Active recall and metacognition",
+            "url": DEFAULT_SOURCES[2],
+            "snippet": "Overview linking retrieval practice to monitoring skills.",
+        },
+    ]
+    return sections, citations
+
+
+def summarize_with_citations(
+    heading: str, sections: Dict[str, List[str]], citations: List[Dict[str, str]]
+) -> Tuple[str, List[str], List[Dict[str, str]]]:
+    """Create a structured markdown summary and enrich citation metadata."""
+
+    if not citations:
+        citations = [
+            {
+                "id": "S1",
+                "title": "Spacing effect in practice",
+                "url": DEFAULT_SOURCES[0],
+                "snippet": "Research summary on distributed practice benefits.",
+            }
+        ]
+
+    for index, citation in enumerate(citations, start=1):
+        citation.setdefault("id", f"S{index}")
+        citation.setdefault("title", f"Source {index}")
+        citation.setdefault("url", DEFAULT_SOURCES[(index - 1) % len(DEFAULT_SOURCES)])
+        citation.setdefault("snippet", "Supporting evidence for the generated summary.")
+
+    citation_cycle = cycle(citations)
+    section_entries: List[Tuple[str, List[Tuple[str, Dict[str, str]]]]] = []
+    ordered_points: List[Tuple[str, Dict[str, str]]] = []
+    cloze_candidates: List[str] = []
+
+    for section_name, bullet_points in sections.items():
+        formatted_points: List[Tuple[str, Dict[str, str]]] = []
+        for point in bullet_points:
+            citation_info = next(citation_cycle)
+            formatted = f"{point} [{citation_info['id']}]"
+            formatted_points.append((formatted, citation_info))
+            ordered_points.append((formatted, citation_info))
+            if "«" in point and "»" in point:
+                start = point.index("«") + 1
+                end = point.index("»", start)
+                term = point[start:end]
+                cloze_text = point.replace(f"«{term}»", "____")
+                cloze_candidates.append(f"{cloze_text} ({term})")
+        section_entries.append((section_name, formatted_points))
+
+    if not cloze_candidates and ordered_points:
+        fallback_point = ordered_points[0][0]
+        cloze_candidates.append(fallback_point.replace("[", "(").replace("]", ")"))
+
+    tldr_points = [point for point, _ in ordered_points[:3]]
+
+    lines: List[str] = [f"# {heading}", "", "## TL;DR"]
+    if tldr_points:
+        lines.extend(f"- {point}" for point in tldr_points)
+    else:
+        lines.append("- Key takeaways will appear here once content is provided.")
+
+    lines.append("")
+    lines.append("## Sectioned Notes")
+    for section_name, formatted_points in section_entries:
+        lines.append(f"### {section_name}")
+        for formatted, _ in formatted_points:
+            lines.append(f"- {formatted}")
+        lines.append("")
+
+    lines.append("## Cloze Cues")
+    if cloze_candidates:
+        lines.extend(f"- {candidate}" for candidate in cloze_candidates)
+    else:
+        lines.append("- Additional review questions will be generated soon.")
+
+    lines.append("")
+    lines.append("## Sources")
+    for index, citation in enumerate(citations, start=1):
+        lines.append(
+            f"{index}. [{citation['title']}]({citation['url']}) — {citation['snippet']}"
+        )
+
+    markdown = "\n".join(lines).rstrip()
+    source_list = [citation["url"] for citation in citations]
+    return markdown, source_list, citations
 
 
 @dataclass
@@ -57,16 +218,23 @@ class InMemoryRepository:
 
     def __init__(self) -> None:
         self._notes: Dict[UUID, str] = {}
+        self._note_citations: Dict[UUID, List[Dict[str, str]]] = {}
         self._cards: Dict[UUID, QuizCard] = {}
         self._due: Dict[UUID, datetime] = {}
         self._user_state: Dict[str, UserState] = {}
 
     # region Notes
-    def save_note(self, note_id: UUID, markdown: str) -> None:
+    def save_note(
+        self, note_id: UUID, markdown: str, citations: Optional[List[Dict[str, str]]] = None
+    ) -> None:
         self._notes[note_id] = markdown
+        self._note_citations[note_id] = list(citations or [])
 
     def get_note(self, note_id: UUID) -> str:
         return self._notes[note_id]
+
+    def get_note_citations(self, note_id: UUID) -> List[Dict[str, str]]:
+        return self._note_citations.get(note_id, [])
 
     # endregion
 
@@ -95,29 +263,20 @@ class InMemoryRepository:
         return self._user_state[user_id]
 
 
-def build_markdown_summary(request: LearnPrepareRequest) -> Tuple[str, List[str]]:
-    """Creates a deterministic placeholder markdown summary for early testing."""
+def build_markdown_summary(
+    request: LearnPrepareRequest,
+) -> Tuple[str, List[str], List[Dict[str, str]]]:
+    """Generate a markdown summary enriched with citations for notes."""
 
-    heading = request.topic_text or f"Document {request.document_id}"
-    tldr = "\n".join(
-        [
-            "## TL;DR",
-            "- Active recall and spaced repetition accelerate retention.",
-            "- Personalized scheduling ensures efficient studying.",
-            "- Combining notes with quizzes encourages retrieval practice.",
-            "- FSRS adapts intervals based on learner feedback.",
-            "- Consistent review prevents forgetting curves from dominating.",
-        ]
-    )
-    body = f"# {heading}\n\n" + tldr
-    body += "\n\n## Key Points\n"
-    body += "- «Spacing effect» supports distributing practice over time. [1]\n"
-    body += "- «Retrieval practice» strengthens neural pathways. [2]\n"
-    body += "- Adaptive schedulers like FSRS leverage review quality scores. [3]\n"
-    body += "\n## Cloze Candidates\n"
-    body += "- The spacing effect demonstrates improved recall when study sessions are spread over time.\n"
-    body += "- FSRS updates the next review interval using grades from 1 to 4.\n"
-    return body, DEFAULT_SOURCES.copy()
+    if request.document_id:
+        sections, citations = extract_document(request.document_id)
+        heading = f"Insights from document {request.document_id}"
+    else:
+        sections, citations = enrich_topic(request.topic_text or "Learning Science")
+        heading = request.topic_text or "Learning Science Overview"
+
+    markdown, sources, citation_metadata = summarize_with_citations(heading, sections, citations)
+    return markdown, sources, citation_metadata
 
 
 def build_quiz_items(request: LearnPrepareRequest) -> List[QuizCard]:
@@ -209,8 +368,10 @@ class LearningService:
 
     def prepare(self, request: LearnPrepareRequest) -> LearnPrepareResponse:
         note_id = uuid4()
-        markdown, sources = build_markdown_summary(request)
-        self._repository.save_note(note_id, markdown)
+        markdown, sources, citations = build_markdown_summary(request)
+        if not sources:
+            raise ValueError("Generated notes must reference at least one source")
+        self._repository.save_note(note_id, markdown, citations)
         items = build_quiz_items(request)
         self._repository.save_cards(items)
         return LearnPrepareResponse(note_id=note_id, content_md=markdown, sources=sources, items=items)
