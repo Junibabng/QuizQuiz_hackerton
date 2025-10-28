@@ -1,11 +1,11 @@
-"""FastAPI application exposing the QuizQuiz Hackerton endpoints."""
+"""FastAPI application wiring for the QuizQuiz prototype."""
+
 from __future__ import annotations
 
 import json
+import os
 from typing import AsyncGenerator
 from uuid import UUID
-from pathlib import Path
-import os
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
@@ -18,57 +18,34 @@ from .models import (
     ReviewGradeRequest,
     ReviewGradeResponse,
 )
-from .services import LearningService, ReviewService
-from .storage import LocalNoteRepository, SqliteStudyRepository
 from .services import BiasConfig, InMemoryRepository, LearningService, ReviewService
+
 
 app = FastAPI(title="QuizQuiz Hackerton", version="0.1.0")
 
 
 def get_learning_service() -> LearningService:
-    return LearningService(app.state.note_repository, app.state.study_repository)
-
-def get_learning_service() -> LearningService:
     return app.state.learning_service
 
-def get_review_service() -> ReviewService:
-    return ReviewService(
-        app.state.study_repository,
-        app.state.study_repository,
-        app.state.study_repository,
-    )
 
 def get_review_service() -> ReviewService:
     return app.state.review_service
-def get_review_service(repository: InMemoryRepository = Depends(get_repository)) -> ReviewService:
-    return ReviewService(repository, bias_config=app.state.bias_config)
 
 
 @app.on_event("startup")
 def startup() -> None:
-    repository = InMemoryRepository()
-    app.state.repository = repository
-    app.state.learning_service = LearningService(repository)
-    app.state.review_service = ReviewService(repository)
-    data_dir = Path("data")
-    data_dir.mkdir(parents=True, exist_ok=True)
-    notes_dir = data_dir / "notes"
-    db_path = data_dir / "study.sqlite3"
-    app.state.note_repository = LocalNoteRepository(notes_dir)
-    app.state.study_repository = SqliteStudyRepository(db_path)
-
-
-@app.on_event("shutdown")
-def shutdown() -> None:
-    if hasattr(app.state, "study_repository"):
-        app.state.study_repository.close()
-    app.state.repository = InMemoryRepository()
     position_bias_threshold = float(os.getenv("QUIZQUIZ_POSITION_BIAS_THRESHOLD", "0.35"))
     option_reuse_threshold = float(os.getenv("QUIZQUIZ_OPTION_REUSE_THRESHOLD", "0.65"))
-    app.state.bias_config = BiasConfig(
+    bias_config = BiasConfig(
         position_bias_threshold=position_bias_threshold,
         option_reuse_threshold=option_reuse_threshold,
     )
+
+    repository = InMemoryRepository()
+    app.state.repository = repository
+    app.state.bias_config = bias_config
+    app.state.learning_service = LearningService(repository)
+    app.state.review_service = ReviewService(repository, bias_config=bias_config)
 
 
 @app.post("/v1/learn/prepare", response_model=LearnPrepareResponse)
@@ -92,7 +69,9 @@ async def learn_prepare_status(
 
 
 @app.get("/v1/learn/jobs/{job_id}/events")
-async def learn_prepare_events(job_id: UUID, service: LearningService = Depends(get_learning_service)) -> StreamingResponse:
+async def learn_prepare_events(
+    job_id: UUID, service: LearningService = Depends(get_learning_service)
+) -> StreamingResponse:
     try:
         await service.get_job_status(job_id)
     except ValueError as exc:
