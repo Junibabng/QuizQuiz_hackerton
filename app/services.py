@@ -455,11 +455,11 @@ class InMemoryRepository:
     def __init__(self) -> None:
         self._notes: Dict[UUID, str] = {}
         self._note_citations: Dict[UUID, List[Dict[str, str]]] = {}
-        self._cards: Dict[UUID, QuizCard] = {}
-        self._states: Dict[UUID, FSRSState] = {}
+        self._cards: Dict[str, Dict[UUID, QuizCard]] = {}
+        self._states: Dict[str, Dict[UUID, FSRSState]] = {}
         self._user_state: Dict[str, UserState] = {}
         self._option_pools: Dict[str, List[str]] = {}
-        self._lapses: Dict[UUID, int] = {}
+        self._lapses: Dict[str, Dict[UUID, int]] = {}
 
     # region Notes
     def save_note(
@@ -477,40 +477,56 @@ class InMemoryRepository:
     # endregion
 
     # region Cards
-    def save_cards(self, cards: Iterable[QuizCard], due_in_minutes: int = 60) -> None:
+    def save_cards(
+        self, user_id: str, cards: Iterable[QuizCard], due_in_minutes: int = 60
+    ) -> None:
         now = datetime.utcnow()
         initial_due = now + timedelta(minutes=due_in_minutes)
         initial_stability = max(due_in_minutes / (60 * 24), 0.2)
         for card in cards:
             self._validate_card(card)
-            self._cards[card.id] = card
-            self._states[card.id] = FSRSState(
+            user_cards = self._cards.setdefault(user_id, {})
+            user_states = self._states.setdefault(user_id, {})
+            user_lapses = self._lapses.setdefault(user_id, {})
+            user_cards[card.id] = card
+            user_states[card.id] = FSRSState(
                 stability=initial_stability,
                 difficulty=DEFAULT_DIFFICULTY,
                 last_review=None,
                 due=initial_due,
             )
+            user_lapses.setdefault(card.id, 0)
 
-    def get_due_cards(self) -> List[Tuple[QuizCard, "FSRSState"]]:
+    def get_due_cards(self, user_id: str) -> List[Tuple[QuizCard, "FSRSState"]]:
         now = datetime.utcnow()
+        user_cards = self._cards.get(user_id, {})
+        user_states = self._states.get(user_id, {})
         return [
-            (self._cards[card_id], state)
-            for card_id, state in self._states.items()
+            (user_cards[card_id], state)
+            for card_id, state in user_states.items()
             if state.due <= now
         ]
 
-    def get_card_state(self, card_id: UUID) -> "FSRSState":
-        return self._states[card_id]
+    def get_card_state(self, user_id: str, card_id: UUID) -> "FSRSState":
+        try:
+            return self._states[user_id][card_id]
+        except KeyError as exc:
+            raise KeyError(f"Card {card_id} does not exist for user {user_id}") from exc
 
-    def save_card_state(self, card_id: UUID, state: "FSRSState") -> None:
-        self._states[card_id] = state
+    def save_card_state(self, user_id: str, card_id: UUID, state: "FSRSState") -> None:
+        if user_id not in self._states or card_id not in self._states[user_id]:
+            raise KeyError(f"Card {card_id} does not exist for user {user_id}")
+        self._states[user_id][card_id] = state
 
-    def register_grade_outcome(self, card_id: UUID, grade: int) -> int:
+    def register_grade_outcome(self, user_id: str, card_id: UUID, grade: int) -> int:
+        user_lapses = self._lapses.setdefault(user_id, {})
+        if card_id not in user_lapses:
+            raise KeyError(f"Card {card_id} does not exist for user {user_id}")
         if grade == 1:
-            self._lapses[card_id] = self._lapses.get(card_id, 0) + 1
+            user_lapses[card_id] = user_lapses.get(card_id, 0) + 1
         else:
-            self._lapses[card_id] = 0
-        return self._lapses[card_id]
+            user_lapses[card_id] = 0
+        return user_lapses[card_id]
 
     # endregion
 
@@ -1112,7 +1128,7 @@ class LearningService:
         items: List[QuizCard],
     ) -> None:
         self._repository.save_note(note_id, markdown, citations)
-        self._repository.save_cards(items)
+        self._repository.save_cards(request.user_id, items)
 
     async def _update_status(self, job: PipelineJob, status: LearnPrepareJobStatus) -> None:
         async with self._lock:
@@ -1169,7 +1185,7 @@ class ReviewService:
             user_id, bias_config=self._bias_config
         )
         due_cards: List[ReviewCard] = []
-        for card, state in self._repository.get_due_cards():
+        for card, state in self._repository.get_due_cards(user_id):
             options: Optional[List[QuizOption]] = None
             answer_index: Optional[int] = None
             variant_id: Optional[str] = None
@@ -1209,16 +1225,20 @@ class ReviewService:
     def grade(self, request: ReviewGradeRequest) -> ReviewGradeResponse:
         now = datetime.utcnow()
         try:
-            state = self._repository.get_card_state(request.card_id)
+            state = self._repository.get_card_state(request.user_id, request.card_id)
         except KeyError as exc:
             raise ValueError(str(exc)) from exc
 
         updated_state = compute_fsrs_state(state, request.grade, now)
-        self._repository.save_card_state(request.card_id, updated_state)
-
-        lapse_count = self._repository.register_grade_outcome(
-            request.card_id, request.grade
-        )
+        try:
+            self._repository.save_card_state(
+                request.user_id, request.card_id, updated_state
+            )
+            lapse_count = self._repository.register_grade_outcome(
+                request.user_id, request.card_id, request.grade
+            )
+        except KeyError as exc:
+            raise ValueError(str(exc)) from exc
         METRICS.record_fsrs_outcome(request.grade, updated_state.stability)
         if lapse_count >= LEECH_LAPSES:
             METRICS.record_leech(str(request.card_id))
