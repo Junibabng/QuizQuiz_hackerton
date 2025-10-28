@@ -81,29 +81,6 @@ class PipelineJob:
     history: List[JobEvent] = field(default_factory=list)
     queue: asyncio.Queue = field(default_factory=asyncio.Queue)
     task: Optional[asyncio.Task] = None
-def build_markdown_summary(request: LearnPrepareRequest) -> Tuple[str, List[str]]:
-    """Creates a deterministic placeholder markdown summary for early testing."""
-
-    heading = request.topic_text or f"Document {request.document_id}"
-    tldr = "\n".join(
-        [
-            "## TL;DR",
-            "- Active recall and spaced repetition accelerate retention.",
-            "- Personalized scheduling ensures efficient studying.",
-            "- Combining notes with quizzes encourages retrieval practice.",
-            "- FSRS adapts intervals based on learner feedback.",
-            "- Consistent review prevents forgetting curves from dominating.",
-        ]
-    )
-    body = f"# {heading}\n\n" + tldr
-    body += "\n\n## Key Points\n"
-    body += "- «Spacing effect» supports distributing practice over time. [1]\n"
-    body += "- «Retrieval practice» strengthens neural pathways. [2]\n"
-    body += "- Adaptive schedulers like FSRS leverage review quality scores. [3]\n"
-    body += "\n## Cloze Candidates\n"
-    body += "- The spacing effect demonstrates improved recall when study sessions are spread over time.\n"
-    body += "- FSRS updates the next review interval using grades from 1 to 4.\n"
-    return body, DEFAULT_SOURCES.copy()
 def extract_document(document_id: str) -> Tuple[Dict[str, List[str]], List[Dict[str, str]]]:
     """Simulated document extraction returning structured sections with citations."""
 
@@ -478,11 +455,11 @@ class InMemoryRepository:
     def __init__(self) -> None:
         self._notes: Dict[UUID, str] = {}
         self._note_citations: Dict[UUID, List[Dict[str, str]]] = {}
-        self._cards: Dict[UUID, QuizCard] = {}
-        self._states: Dict[UUID, FSRSState] = {}
+        self._cards: Dict[str, Dict[UUID, QuizCard]] = {}
+        self._states: Dict[str, Dict[UUID, FSRSState]] = {}
         self._user_state: Dict[str, UserState] = {}
         self._option_pools: Dict[str, List[str]] = {}
-        self._lapses: Dict[UUID, int] = {}
+        self._lapses: Dict[str, Dict[UUID, int]] = {}
 
     # region Notes
     def save_note(
@@ -500,40 +477,56 @@ class InMemoryRepository:
     # endregion
 
     # region Cards
-    def save_cards(self, cards: Iterable[QuizCard], due_in_minutes: int = 60) -> None:
+    def save_cards(
+        self, user_id: str, cards: Iterable[QuizCard], due_in_minutes: int = 60
+    ) -> None:
         now = datetime.utcnow()
         initial_due = now + timedelta(minutes=due_in_minutes)
         initial_stability = max(due_in_minutes / (60 * 24), 0.2)
         for card in cards:
             self._validate_card(card)
-            self._cards[card.id] = card
-            self._states[card.id] = FSRSState(
+            user_cards = self._cards.setdefault(user_id, {})
+            user_states = self._states.setdefault(user_id, {})
+            user_lapses = self._lapses.setdefault(user_id, {})
+            user_cards[card.id] = card
+            user_states[card.id] = FSRSState(
                 stability=initial_stability,
                 difficulty=DEFAULT_DIFFICULTY,
                 last_review=None,
                 due=initial_due,
             )
+            user_lapses.setdefault(card.id, 0)
 
-    def get_due_cards(self) -> List[Tuple[QuizCard, "FSRSState"]]:
+    def get_due_cards(self, user_id: str) -> List[Tuple[QuizCard, "FSRSState"]]:
         now = datetime.utcnow()
+        user_cards = self._cards.get(user_id, {})
+        user_states = self._states.get(user_id, {})
         return [
-            (self._cards[card_id], state)
-            for card_id, state in self._states.items()
+            (user_cards[card_id], state)
+            for card_id, state in user_states.items()
             if state.due <= now
         ]
 
-    def get_card_state(self, card_id: UUID) -> "FSRSState":
-        return self._states[card_id]
+    def get_card_state(self, user_id: str, card_id: UUID) -> "FSRSState":
+        try:
+            return self._states[user_id][card_id]
+        except KeyError as exc:
+            raise KeyError(f"Card {card_id} does not exist for user {user_id}") from exc
 
-    def save_card_state(self, card_id: UUID, state: "FSRSState") -> None:
-        self._states[card_id] = state
+    def save_card_state(self, user_id: str, card_id: UUID, state: "FSRSState") -> None:
+        if user_id not in self._states or card_id not in self._states[user_id]:
+            raise KeyError(f"Card {card_id} does not exist for user {user_id}")
+        self._states[user_id][card_id] = state
 
-    def register_grade_outcome(self, card_id: UUID, grade: int) -> int:
+    def register_grade_outcome(self, user_id: str, card_id: UUID, grade: int) -> int:
+        user_lapses = self._lapses.setdefault(user_id, {})
+        if card_id not in user_lapses:
+            raise KeyError(f"Card {card_id} does not exist for user {user_id}")
         if grade == 1:
-            self._lapses[card_id] = self._lapses.get(card_id, 0) + 1
+            user_lapses[card_id] = user_lapses.get(card_id, 0) + 1
         else:
-            self._lapses[card_id] = 0
-        return self._lapses[card_id]
+            user_lapses[card_id] = 0
+        return user_lapses[card_id]
 
     # endregion
 
@@ -1068,8 +1061,16 @@ class LearningService:
         try:
             await self._update_status(job, LearnPrepareJobStatus.RUNNING)
             await self._run_stage(job, "ingestion", self._stage_ingestion, request)
-            markdown, sources = await self._run_stage(job, "summarization", self._stage_summarization, request)
-            items = await self._run_stage(job, "quiz_synthesis", self._stage_quiz_synthesis, request)
+            markdown, sources, citations = await self._run_stage(
+                job, "summarization", self._stage_summarization, request
+            )
+            items = await self._run_stage(
+                job,
+                "quiz_synthesis",
+                self._stage_quiz_synthesis,
+                request,
+                markdown,
+            )
             await self._run_stage(
                 job,
                 "rendering",
@@ -1077,6 +1078,7 @@ class LearningService:
                 note_id,
                 markdown,
                 sources,
+                citations,
                 items,
             )
         except Exception as exc:  # pragma: no cover - defensive logging path
@@ -1107,21 +1109,26 @@ class LearningService:
     async def _stage_ingestion(self, request: LearnPrepareRequest) -> None:
         await asyncio.sleep(0)
 
-    async def _stage_summarization(self, request: LearnPrepareRequest) -> Tuple[str, List[str]]:
+    async def _stage_summarization(
+        self, request: LearnPrepareRequest
+    ) -> Tuple[str, List[str], List[Dict[str, str]]]:
         return build_markdown_summary(request)
 
-    async def _stage_quiz_synthesis(self, request: LearnPrepareRequest) -> List[QuizCard]:
-        return build_quiz_items(request)
+    async def _stage_quiz_synthesis(
+        self, request: LearnPrepareRequest, markdown: str
+    ) -> List[QuizCard]:
+        return build_quiz_items(request, markdown, self._repository)
 
     async def _stage_rendering(
         self,
         note_id: UUID,
         markdown: str,
         sources: List[str],
+        citations: List[Dict[str, str]],
         items: List[QuizCard],
     ) -> None:
-        self._repository.save_note(note_id, markdown)
-        self._repository.save_cards(items)
+        self._repository.save_note(note_id, markdown, citations)
+        self._repository.save_cards(request.user_id, items)
 
     async def _update_status(self, job: PipelineJob, status: LearnPrepareJobStatus) -> None:
         async with self._lock:
@@ -1164,81 +1171,41 @@ class LearningService:
             else:
                 normalized[key] = value
         return normalized
-    def __init__(
-        self, note_repository: NoteRepository, card_repository: QuizCardRepository
-    ) -> None:
-        self._note_repository = note_repository
-        self._card_repository = card_repository
-
-    def prepare(self, request: LearnPrepareRequest) -> LearnPrepareResponse:
-        METRICS.record_generation_attempt()
-        note_id = uuid4()
-        markdown, sources = build_markdown_summary(request)
-        self._note_repository.save(request.user_id, note_id, markdown)
-        items = build_quiz_items(request)
-        self._card_repository.save_cards(request.user_id, items)
-        try:
-            markdown, sources = build_markdown_summary(request)
-            validate_note(markdown, sources)
-            items = build_quiz_items(request)
-            validate_quiz_cards(items)
-        except Exception as exc:
-            METRICS.record_generation_failure(exc.__class__.__name__)
-            raise
-
-        self._repository.save_note(note_id, markdown)
-        items = build_quiz_items(request, markdown, self._repository)
-        self._repository.save_cards(items)
-        METRICS.record_generation_success(len(items))
-        return LearnPrepareResponse(note_id=note_id, content_md=markdown, sources=sources, items=items)
-
-
 class ReviewService:
     """Manages the spaced repetition review loop."""
 
     def __init__(
-        self,
-        card_repository: QuizCardRepository,
-        metadata_repository: UserMetadataRepository,
-        fsrs_repository: FSRSStateRepository,
+        self, repository: InMemoryRepository, bias_config: Optional[BiasConfig] = None
     ) -> None:
-        self._card_repository = card_repository
-        self._metadata_repository = metadata_repository
-        self._fsrs_repository = fsrs_repository
-
-    def get_due(self, user_id: str) -> ReviewDueResponse:
-        user_state = self._metadata_repository.get_user_state(user_id)
-        due_cards: List[ReviewCard] = []
-        for card, due_at in self._card_repository.get_due_cards(user_id):
-    def __init__(self, repository: InMemoryRepository, bias_config: Optional[BiasConfig] = None) -> None:
         self._repository = repository
         self._bias_config = bias_config or BiasConfig()
 
     def get_due(self, user_id: str) -> ReviewDueResponse:
-        user_state = self._repository.get_user_state(user_id, bias_config=self._bias_config)
+        user_state = self._repository.get_user_state(
+            user_id, bias_config=self._bias_config
+        )
         due_cards: List[ReviewCard] = []
-        for card, state in self._repository.get_due_cards():
-            options = None
-            answer_index = None
-            variant_id = None
+        for card, state in self._repository.get_due_cards(user_id):
+            options: Optional[List[QuizOption]] = None
+            answer_index: Optional[int] = None
+            variant_id: Optional[str] = None
             regenerated = False
+
             if card.type == "mcq" and card.options:
                 (
-                    shuffled,
+                    options,
                     answer_index,
                     variant_id,
                     regenerated,
                 ) = render_mcq(
                     card,
                     user_state,
-                    session_seed=hash((card.id, user_id, due_at)),
+                    session_seed=hash((card.id, user_id, state.due)),
                     bias_config=self._bias_config,
-                shuffled, answer_index = render_mcq(
-                    card, user_state, session_seed=hash((card.id, user_id, due_at))
                 )
-                options = shuffled
-                if answer_index is not None:
+                if answer_index is not None and answer_index >= 0:
                     METRICS.record_answer_position(user_id, answer_index)
+
             due_cards.append(
                 ReviewCard(
                     card_id=card.id,
@@ -1246,45 +1213,48 @@ class ReviewService:
                     options=options,
                     answer_index=answer_index,
                     type=card.type,
-                    due_at=due_at,
-                    variant_id=variant_id,
-                    stale_pool=regenerated,
                     due_at=state.due,
+                    variant_id=variant_id or None,
+                    stale_pool=regenerated,
                     is_leech=state.is_leech,
                 )
             )
-        self._metadata_repository.save_user_state(user_id, user_state)
+
         return ReviewDueResponse(due=due_cards)
 
     def grade(self, request: ReviewGradeRequest) -> ReviewGradeResponse:
         now = datetime.utcnow()
-        # Simplified FSRS placeholder: increase interval by grade multiplier.
-        multiplier = {1: 5, 2: 30, 3: 60, 4: 120}[request.grade]
-        next_due = now + timedelta(minutes=multiplier)
-        previous_state = self._fsrs_repository.load_state(request.user_id, request.card_id) or {}
-        state = {
-            "interval_minutes": multiplier,
-            "last_grade": request.grade,
-            "previous_interval": previous_state.get("interval_minutes"),
-        }
         try:
-            self._card_repository.update_due(request.user_id, request.card_id, next_due)
+            state = self._repository.get_card_state(request.user_id, request.card_id)
         except KeyError as exc:
             raise ValueError(str(exc)) from exc
-        self._fsrs_repository.save_state(request.user_id, request.card_id, state)
-        return ReviewGradeResponse(card_id=request.card_id, next_due_at=next_due, state=state)
 
-
-__all__ = [
-        self._repository.update_due(request.card_id, next_due)
-        lapse_count = self._repository.register_grade_outcome(request.card_id, request.grade)
-        METRICS.record_fsrs_outcome(request.grade, multiplier)
-        if lapse_count >= 3:
+        updated_state = compute_fsrs_state(state, request.grade, now)
+        try:
+            self._repository.save_card_state(
+                request.user_id, request.card_id, updated_state
+            )
+            lapse_count = self._repository.register_grade_outcome(
+                request.user_id, request.card_id, request.grade
+            )
+        except KeyError as exc:
+            raise ValueError(str(exc)) from exc
+        METRICS.record_fsrs_outcome(request.grade, updated_state.stability)
+        if lapse_count >= LEECH_LAPSES:
             METRICS.record_leech(str(request.card_id))
+
         return ReviewGradeResponse(
             card_id=request.card_id,
-            next_due_at=next_due,
-            state={"interval_minutes": multiplier},
+            next_due_at=updated_state.due,
+            state={
+                "stability": updated_state.stability,
+                "difficulty": updated_state.difficulty,
+                "last_review": updated_state.last_review.isoformat()
+                if updated_state.last_review
+                else None,
+                "lapses": updated_state.lapses,
+                "reviews": updated_state.reviews,
+            },
         )
 
 
